@@ -6,7 +6,7 @@ import Debug from 'debug'
 import randombytes from 'randombytes'
 import RC4 from 'rc4'
 import stream from 'readable-stream'
-import sha1 from 'simple-sha1'
+import { sha1 } from 'uint8-util'
 import throughput from 'throughput'
 import arrayRemove from 'unordered-array-remove'
 
@@ -261,13 +261,13 @@ class Wire extends stream.Duplex {
     this._push(Buffer.concat([Buffer.from(this._myPubKey, 'hex'), padB]))
   }
 
-  sendPe3 (infoHash) {
-    this.setEncrypt(this._sharedSecret, infoHash)
+  async sendPe3 (infoHash) {
+    await this.setEncrypt(this._sharedSecret, infoHash)
 
-    const hash1Buffer = Buffer.from(sha1.sync(Buffer.from(this._utfToHex('req1') + this._sharedSecret, 'hex')), 'hex')
+    const hash1Buffer = Buffer.from(await new Promise(resolve => sha1(Buffer.from(this._utfToHex('req1') + this._sharedSecret, 'hex'), resolve)), 'hex')
 
-    const hash2Buffer = Buffer.from(sha1.sync(Buffer.from(this._utfToHex('req2') + infoHash, 'hex')), 'hex')
-    const hash3Buffer = Buffer.from(sha1.sync(Buffer.from(this._utfToHex('req3') + this._sharedSecret, 'hex')), 'hex')
+    const hash2Buffer = Buffer.from(await new Promise(resolve => sha1(Buffer.from(this._utfToHex('req2') + infoHash, 'hex'), resolve)), 'hex')
+    const hash3Buffer = Buffer.from(await new Promise(resolve => sha1(Buffer.from(this._utfToHex('req3') + this._sharedSecret, 'hex'), resolve)), 'hex')
     const hashesXorBuffer = xor(hash2Buffer, hash3Buffer)
 
     const padCLen = randombytes(2).readUInt16BE(0) % 512
@@ -285,8 +285,8 @@ class Wire extends stream.Duplex {
     this._push(Buffer.concat([hash1Buffer, hashesXorBuffer, vcAndProvideBuffer]))
   }
 
-  sendPe4 (infoHash) {
-    this.setEncrypt(this._sharedSecret, infoHash)
+  async sendPe4 (infoHash) {
+    await this.setEncrypt(this._sharedSecret, infoHash)
 
     const padDLen = randombytes(2).readUInt16BE(0) % 512
     const padDBuffer = randombytes(padDLen)
@@ -602,7 +602,7 @@ class Wire extends stream.Duplex {
    * @param {string} infoHash:  A hex-encoded info hash
    * @returns boolean, true if encryption setting succeeds, false if it fails.
    */
-  setEncrypt (sharedSecret, infoHash) {
+  async setEncrypt (sharedSecret, infoHash) {
     let encryptKey
     let decryptKey
     let encryptKeyBuf
@@ -611,8 +611,8 @@ class Wire extends stream.Duplex {
     let decryptKeyIntArray
     switch (this.type) {
       case 'tcpIncoming':
-        encryptKey = sha1.sync(Buffer.from(this._utfToHex('keyB') + sharedSecret + infoHash, 'hex'))
-        decryptKey = sha1.sync(Buffer.from(this._utfToHex('keyA') + sharedSecret + infoHash, 'hex'))
+        encryptKey = await new Promise(resolve => sha1(Buffer.from(this._utfToHex('keyB') + sharedSecret + infoHash, 'hex'), resolve))
+        decryptKey = await new Promise(resolve => sha1(Buffer.from(this._utfToHex('keyA') + sharedSecret + infoHash, 'hex'), resolve))
         encryptKeyBuf = Buffer.from(encryptKey, 'hex')
         encryptKeyIntArray = []
         for (const value of encryptKeyBuf.values()) {
@@ -627,8 +627,8 @@ class Wire extends stream.Duplex {
         this._decryptGenerator = new RC4(decryptKeyIntArray)
         break
       case 'tcpOutgoing':
-        encryptKey = sha1.sync(Buffer.from(this._utfToHex('keyA') + sharedSecret + infoHash, 'hex'))
-        decryptKey = sha1.sync(Buffer.from(this._utfToHex('keyB') + sharedSecret + infoHash, 'hex'))
+        encryptKey = await new Promise(resolve => sha1(Buffer.from(this._utfToHex('keyA') + sharedSecret + infoHash, 'hex'), resolve))
+        decryptKey = await new Promise(resolve => sha1(Buffer.from(this._utfToHex('keyB') + sharedSecret + infoHash, 'hex'), resolve))
         encryptKeyBuf = Buffer.from(encryptKey, 'hex')
         encryptKeyIntArray = []
         for (const value of encryptKeyBuf.values()) {
