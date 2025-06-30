@@ -904,22 +904,22 @@ class Wire extends Duplex {
       const index = findArrayIndex(this._buffer[0], this._cryptoSyncPattern)
       if (index !== -1) {
         this._buffer[0] = this._buffer[0].slice(index + this._cryptoSyncPattern.length)
-        this._bufferSize -= (index + this._cryptoSyncPattern.length)
+        this._buffer[0].length -= (index + this._cryptoSyncPattern.length)
         this._cryptoSyncPattern = null
-      } else if (this._bufferSize > this._waitMaxBytes + this._cryptoSyncPattern.length) {
+      } else if (this._buffer[0].length > this._waitMaxBytes + this._cryptoSyncPattern.length) {
         this._debug('Error: could not resynchronize')
         this.destroy()
         return
       }
     }
 
-    while (this._bufferSize >= this._parserSize && !this._cryptoSyncPattern) {
+    while (this._buffer[0].length >= this._parserSize && !this._cryptoSyncPattern) {
       if (this._parserSize === 0) {
         this._parser(new Uint8Array())
       } else {
         const buffer = this._buffer[0]
-        this._bufferSize -= this._parserSize
-        this._buffer = this._bufferSize
+        this._buffer[0].length -= this._parserSize
+        this._buffer = this._buffer[0].length
           ? [buffer.slice(this._parserSize)]
           : []
         this._parser(buffer.slice(0, this._parserSize))
