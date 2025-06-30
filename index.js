@@ -1111,36 +1111,51 @@ class Wire extends Duplex {
         padCBuffer = this._decryptHandshake(padCBuffer)
         this._parse(2, iaLenBuf => {
           const iaLen = new DataView(this._decryptHandshake(iaLenBuf).buffer).getUint16(0, false)
-          this._parse(iaLen, iaBuffer => {
-            iaBuffer = this._decryptHandshake(iaBuffer)
-            if (!equal(vcBuffer, VC)) {
-              this._debug('Error: verification constant did not match')
-              this.destroy()
-              return
-            }
-
-            for (const provideByte of peerProvideBuffer) {
-              if (provideByte !== 0) {
-                this._peerCryptoProvide.push(provideByte)
+          if (iaLen) {
+            this._parse(iaLen, iaBuffer => {
+              iaBuffer = this._decryptHandshake(iaBuffer)
+              this._onPe3Encrypted(vcBuffer, peerProvideBuffer)
+              const pstrlen = iaLen ? iaBuffer[0] : null
+              const protocol = iaLen ? iaBuffer.slice(1, 20) : null
+              if (pstrlen === 19 && arr2text(protocol) === 'BitTorrent protocol') {
+                if (iaBuffer.length > 20) {
+                  this._onHandshakeBuffer(iaBuffer.slice(1))
+                }
+              } else {
+                this._parseHandshake()
               }
-            }
-            if (this._peerCryptoProvide.includes(2)) {
-              this._encryptionMethod = 2
-            } else {
-              this._debug('Error: RC4 encryption method not provided by peer')
-              this.destroy()
-            }
-            const pstrlen = iaLen ? iaBuffer[0] : null
-            const protocol = iaLen ? iaBuffer.slice(1, 20) : null
-            if (pstrlen === 19 && arr2text(protocol) === 'BitTorrent protocol') {
-              this._onHandshakeBuffer(iaBuffer.slice(1))
-            } else {
-              this._parseHandshake()
-            }
-          })
+            })
+          } else {
+            // parseHandshake always expects plain data
+            this._buffer[0] = this._decryptHandshake(this._buffer[0])
+            this._onPe3Encrypted(vcBuffer, peerProvideBuffer)
+            this._parseHandshake()
+          }
         })
       })
     })
+  }
+
+  _onPe3Encrypted (vcBuffer, peerProvideBuffer) {
+    if (!equal(vcBuffer, VC)) {
+      this._debug('Error: verification constant did not match')
+      this.destroy()
+      return
+    }
+
+    for (const provideByte of peerProvideBuffer.values()) {
+      if (provideByte !== 0) {
+        this._peerCryptoProvide.push(provideByte)
+      }
+    }
+    if (this._peerCryptoProvide.includes(2)) {
+      this._encryptionMethod = 2
+    } else {
+      this._debug('Error: RC4 encryption method not provided by peer')
+      this.destroy()
+    }
+    this._cryptoHandshakeDone = true
+    this._debug('crypto handshake done')
   }
 
   _parsePe4 () {
