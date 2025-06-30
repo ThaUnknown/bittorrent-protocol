@@ -916,7 +916,6 @@ class Wire extends Duplex {
         this._parser(new Uint8Array())
       } else {
         const buffer = this._buffer[0]
-        this._buffer[0].length -= this._parserSize
         this._buffer = this._buffer[0].length
           ? [buffer.slice(this._parserSize)]
           : []
