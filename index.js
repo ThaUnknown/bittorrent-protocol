@@ -894,7 +894,6 @@ class Wire extends Duplex {
     if (this._encryptionMethod === 2 && this._cryptoHandshakeDone) {
       data = this._decrypt(data)
     }
-    this._bufferSize += data.length
     this._buffer.push(data)
     if (this._buffer.length > 1) {
       this._buffer = [concat(this._buffer)]
@@ -904,7 +903,6 @@ class Wire extends Duplex {
       const index = findArrayIndex(this._buffer[0], this._cryptoSyncPattern)
       if (index !== -1) {
         this._buffer[0] = this._buffer[0].slice(index + this._cryptoSyncPattern.length)
-        this._buffer[0].length -= (index + this._cryptoSyncPattern.length)
         this._cryptoSyncPattern = null
       } else if (this._buffer[0].length > this._waitMaxBytes + this._cryptoSyncPattern.length) {
         this._debug('Error: could not resynchronize')
