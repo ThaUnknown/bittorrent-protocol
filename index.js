@@ -897,7 +897,7 @@ class Wire extends Duplex {
     this._bufferSize += data.length
     this._buffer.push(data)
     if (this._buffer.length > 1) {
-      this._buffer = [concat(this._buffer, this._bufferSize)]
+      this._buffer = [concat(this._buffer)]
     }
     // now this._buffer is an array containing a single Buffer
     if (this._cryptoSyncPattern) {
@@ -906,7 +906,7 @@ class Wire extends Duplex {
         this._buffer[0] = this._buffer[0].slice(index + this._cryptoSyncPattern.length)
         this._bufferSize -= (index + this._cryptoSyncPattern.length)
         this._cryptoSyncPattern = null
-      } else if (this._bufferSize + data.length > this._waitMaxBytes + this._cryptoSyncPattern.length) {
+      } else if (this._bufferSize > this._waitMaxBytes + this._cryptoSyncPattern.length) {
         this._debug('Error: could not resynchronize')
         this.destroy()
         return
@@ -1106,9 +1106,10 @@ class Wire extends Duplex {
 
   _parsePe3Encrypted () {
     this._parse(14, buffer => {
-      const vcBuffer = this._decryptHandshake(buffer.slice(0, 8))
-      const peerProvideBuffer = this._decryptHandshake(buffer.slice(8, 12))
-      const padCLen = new DataView(this._decryptHandshake(buffer.slice(12, 14)).buffer).getUint16(0, false)
+      const decrypted = this._decryptHandshake(buffer)
+      const vcBuffer = decrypted.slice(0, 8)
+      const peerProvideBuffer = decrypted.slice(8, 12)
+      const padCLen = new DataView(decrypted.buffer).getUint16(12, false)
       this._parse(padCLen, padCBuffer => {
         padCBuffer = this._decryptHandshake(padCBuffer)
         this._parse(2, iaLenBuf => {
