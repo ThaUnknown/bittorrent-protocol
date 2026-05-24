@@ -1,13 +1,12 @@
 /*! bittorrent-protocol. MIT License. WebTorrent LLC <https://webtorrent.io/opensource> */
 import bencode from 'bencode'
 import BitField from 'bitfield'
-import crypto from 'crypto'
 import Debug from 'debug'
-import RC4 from 'rc4'
 import { Duplex } from 'streamx'
-import { hash, concat, equal, hex2arr, arr2hex, text2arr, arr2text, randomBytes } from 'uint8-util'
+import { concat, equal, hex2arr, arr2hex, text2arr, arr2text, randomBytes, hash } from 'uint8-util'
 import throughput from 'throughput'
 import arrayRemove from 'unordered-array-remove'
+import { MessageStreamEncryptor, REQ1_STR, REQ3_STR, VC, xor } from './mse.js'
 
 const debug = Debug('bittorrent-protocol')
 
@@ -29,16 +28,8 @@ const MESSAGE_PORT = [0x00, 0x00, 0x00, 0x03, 0x09, 0x00, 0x00]
 const MESSAGE_HAVE_ALL = new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x0E])
 const MESSAGE_HAVE_NONE = new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x0F])
 
-const DH_PRIME = 'ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a63a36210000000000090563'
-const DH_GENERATOR = 2
-const VC = new Uint8Array([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
-const CRYPTO_PROVIDE = new Uint8Array([0x00, 0x00, 0x01, 0x02])
-const CRYPTO_SELECT = new Uint8Array([0x00, 0x00, 0x00, 0x02]) // always try to choose RC4 encryption instead of plaintext
+const SYNC_MAX_BYTES = 512
 
-function xor (a, b) {
-  for (let len = a.length; len--;) a[len] ^= b[len]
-  return a
-}
 /**
  * @param {Uint8Array} buffer
  * @param {number} at
@@ -145,25 +136,15 @@ class Wire extends Duplex {
     this._bufferSize = 0 // cached total length of buffers in `this._buffer`
 
     this._peEnabled = peEnabled
-    if (peEnabled) {
-      this._dh = crypto.createDiffieHellman(DH_PRIME, 'hex', DH_GENERATOR) // crypto object used to generate keys/secret
-      this._myPubKey = this._dh.generateKeys('hex') // my DH public key
-    } else {
-      this._myPubKey = null
-    }
-    this._peerPubKey = null // peer's DH public key
-    this._sharedSecret = null // shared DH secret
-    this._peerCryptoProvide = [] // encryption methods provided by peer; we expect this to always contain 0x02
+    this._peState = 'idle' // idle | sentPe1 | gotPe2 | sentPe3 | gotPe3 | done | fallback
+    this._asyncParsePending = false
+    this._encryptor = null
+    this._infoHash = null
     this._cryptoHandshakeDone = false
 
     this._cryptoSyncPattern = null // the pattern to search for when resynchronizing after receiving pe1/pe2
     this._waitMaxBytes = null // the maximum number of bytes resynchronization must occur within
     this._encryptionMethod = null // 1 for plaintext, 2 for RC4
-    this._encryptGenerator = null // RC4 keystream generator for encryption
-    this._decryptGenerator = null // RC4 keystream generator for decryption
-    this._setGenerators = false // a flag for whether setEncrypt() has successfully completed
-
-    this.once('finish', () => this._onFinish())
 
     this.on('finish', this._onFinish)
     this._debug('type:', this.type)
@@ -264,62 +245,18 @@ class Wire extends Duplex {
     this._push(MESSAGE_KEEP_ALIVE)
   }
 
-  sendPe1 () {
-    if (this._peEnabled) {
-      const padALen = Math.floor(Math.random() * 513)
-      const padA = randomBytes(padALen)
-      this._push(concat([hex2arr(this._myPubKey), padA]))
-    }
-  }
-
-  sendPe2 () {
-    const padBLen = Math.floor(Math.random() * 513)
-    const padB = randomBytes(padBLen)
-    this._push(concat([hex2arr(this._myPubKey), padB]))
-  }
-
-  async sendPe3 (infoHash) {
-    await this.setEncrypt(this._sharedSecret, infoHash)
-
-    const hash1Buffer = await hash(hex2arr(this._utfToHex('req1') + this._sharedSecret))
-
-    const hash2Buffer = await hash(hex2arr(this._utfToHex('req2') + infoHash))
-    const hash3Buffer = await hash(hex2arr(this._utfToHex('req3') + this._sharedSecret))
-    const hashesXorBuffer = xor(hash2Buffer, hash3Buffer)
-
-    const padCLen = new DataView(randomBytes(2).buffer).getUint16(0) % 512
-    const padCBuffer = randomBytes(padCLen)
-
-    let vcAndProvideBuffer = new Uint8Array(8 + 4 + 2 + padCLen + 2)
-    vcAndProvideBuffer.set(VC)
-    vcAndProvideBuffer.set(CRYPTO_PROVIDE, 8)
-
-    const view = new DataView(vcAndProvideBuffer.buffer)
-
-    view.setInt16(12, padCLen) // pad C length
-    padCBuffer.copy(vcAndProvideBuffer, 14)
-    view.setInt16(14 + padCLen, 0) // IA length
-    vcAndProvideBuffer = this._encryptHandshake(vcAndProvideBuffer)
-
-    this._push(concat([hash1Buffer, hashesXorBuffer, vcAndProvideBuffer]))
-  }
-
-  async sendPe4 (infoHash) {
-    await this.setEncrypt(this._sharedSecret, infoHash)
-
-    const padDLen = new DataView(randomBytes(2).buffer).getUint16(0) % 512
-    const padDBuffer = randomBytes(padDLen)
-    let vcAndSelectBuffer = new Uint8Array(8 + 4 + 2 + padDLen)
-    const view = new DataView(vcAndSelectBuffer.buffer)
-
-    vcAndSelectBuffer.set(VC)
-    vcAndSelectBuffer.set(CRYPTO_SELECT, 8)
-    view.setInt16(12, padDLen) // lenD?
-    vcAndSelectBuffer.set(padDBuffer, 14)
-    vcAndSelectBuffer = this._encryptHandshake(vcAndSelectBuffer)
-    this._push(vcAndSelectBuffer)
-    this._cryptoHandshakeDone = true
-    this._debug('completed crypto handshake')
+  /**
+   * Start the PE/MSE handshake as initiator.
+   * @param {string} infoHash hex-encoded info hash
+   */
+  startEncryption (infoHash) {
+    if (!this._peEnabled) return
+    this._infoHash = infoHash
+    this._encryptor = new MessageStreamEncryptor(infoHash)
+    const step1 = this._encryptor.generateStepA1()
+    this._push(step1)
+    this._peState = 'sentPe1'
+    this._debug('PE: sent step 1 (initiator)')
   }
 
   /**
@@ -617,32 +554,19 @@ class Wire extends Duplex {
 
   /**
    * Sets the encryption method for this wire, as per PSE/ME specification
-   *
-   * @param {string} sharedSecret:  A hex-encoded string, which is the shared secret agreed
-   *                                upon from DH key exchange
-   * @param {string} infoHash:  A hex-encoded info hash
-   * @returns boolean, true if encryption setting succeeds, false if it fails.
+   * Called by conn-pool when it resolves the infoHash from a crypto-infohash event.
+   * Initializes the responder's ciphers and resumes pe3 processing.
+   * @param {string} infoHash hex-encoded info hash
    */
-  async setEncrypt (sharedSecret, infoHash) {
-    if (!this.type.startsWith('tcp')) return false
-
-    const outgoing = this.type === 'tcpOutgoing'
-
-    const keyAGenerator = new RC4([...await hash(hex2arr(this._utfToHex('keyA') + sharedSecret + infoHash))])
-    const keyBGenerator = new RC4([...await hash(hex2arr(this._utfToHex('keyB') + sharedSecret + infoHash))])
-
-    this._encryptGenerator = outgoing ? keyAGenerator : keyBGenerator
-    this._decryptGenerator = outgoing ? keyBGenerator : keyAGenerator
-
-    // Discard the first 1024 bytes, as per MSE/PE implementation
-    for (let i = 0; i < 1024; i++) {
-      this._encryptGenerator.randomByte()
-      this._decryptGenerator.randomByte()
+  async setInfoHash (infoHash) {
+    this._infoHash = infoHash
+    this._encryptor.skeyHex = infoHash.toLowerCase()
+    await this._encryptor._initializeCiphers('B')
+    this._parsePe3Encrypted()
+    if (this._pePendingResolver) {
+      this._pePendingResolver()
+      this._pePendingResolver = null
     }
-
-    this._setGenerators = true
-    this.emit('_generators')
-    return true
   }
 
   /**
@@ -664,8 +588,8 @@ class Wire extends Duplex {
 
   _push (data) {
     if (this._finished) return
-    if (this._encryptionMethod === 2 && this._cryptoHandshakeDone) {
-      data = this._encrypt(data)
+    if (this._encryptionMethod === 2 && this._cryptoHandshakeDone && this._encryptor) {
+      data = this._encryptor.encrypt(data)
     }
     return this.push(data)
   }
@@ -679,53 +603,39 @@ class Wire extends Duplex {
     this.emit('keep-alive')
   }
 
-  _onPe1 (pubKeyBuffer) {
-    this._peerPubKey = arr2hex(pubKeyBuffer)
-    this._sharedSecret = this._dh.computeSecret(this._peerPubKey, 'hex', 'hex')
-    this.emit('pe1')
-  }
-
-  _onPe2 (pubKeyBuffer) {
-    this._peerPubKey = arr2hex(pubKeyBuffer)
-    this._sharedSecret = this._dh.computeSecret(this._peerPubKey, 'hex', 'hex')
-    this.emit('pe2')
-  }
-
-  async _onPe3 (hashesXorBuffer) {
-    const hash3 = await hash(hex2arr(this._utfToHex('req3') + this._sharedSecret))
-    const sKeyHash = arr2hex(xor(hash3, hashesXorBuffer))
-    this.emit('pe3', sKeyHash)
-  }
-
-  _onPe3Encrypted (vcBuffer, peerProvideBuffer) {
-    if (!equal(vcBuffer, VC)) {
-      this._debug('Error: verification constant did not match')
-      this.destroy()
-      return
+  /**
+   * Advance the PE state machine when conditions are met
+   * (e.g. infoHash is available, previous step completed).
+   */
+  async _advanceEncryption () {
+    if (this._peState === 'gotPe2' && this._infoHash) {
+      // Initiator: send step 3
+      const step3 = await this._encryptor.generateStepA3()
+      // Parse step4 before pushing step3 (may arrive synchronously)
+      this._peState = 'sentPe3'
+      this._debug('PE: sent step 3 (initiator)')
+      this._parsePe4()
+      this._push(step3)
     }
-
-    for (const provideByte of peerProvideBuffer.values()) {
-      if (provideByte !== 0) {
-        this._peerCryptoProvide.push(provideByte)
-      }
-    }
-    if (this._peerCryptoProvide.includes(2)) {
+    if (this._peState === 'gotPe3' && this._infoHash) {
+      // Responder: send step 4
+      const step4 = this._encryptor.generateStepB4()
+      // Already encrypted - must not be re-encrypted
+      this._push(step4)
+      this._cryptoHandshakeDone = true
       this._encryptionMethod = 2
-    } else {
-      this._debug('Error: RC4 encryption method not provided by peer')
-      this.destroy()
+      this._encryptor._isEncrypted = true
+      // Decrypt data that was buffered before crypto was established
+      if (this._bufferSize > 0) {
+        const buf = concat(this._buffer, this._bufferSize)
+        this._buffer = [this._encryptor.decrypt(buf)]
+      }
+      this._peState = 'done'
+      this._debug('PE: sent step 4 (responder), crypto handshake done')
+      this.emit('crypto-handshake')
+      // If handshake was already received via IA, don't re-parse it
+      if (!this.peerId) this._parseHandshake(null)
     }
-  }
-
-  _onPe4 (peerSelectBuffer) {
-    this._encryptionMethod = peerSelectBuffer[3]
-    if (!CRYPTO_PROVIDE.includes(this._encryptionMethod)) {
-      this._debug('Error: peer selected invalid crypto method')
-      this.destroy()
-    }
-    this._cryptoHandshakeDone = true
-    this._debug('crypto handshake done')
-    this.emit('pe4')
   }
 
   _onHandshake (infoHashBuffer, peerIdBuffer, extensions) {
@@ -961,43 +871,64 @@ class Wire extends Duplex {
    * @param  {function} cb
    */
   _write (data, cb) {
-    if (this._encryptionMethod === 2 && this._cryptoHandshakeDone) {
-      data = this._decrypt(data)
+    if (this._encryptionMethod === 2 && this._cryptoHandshakeDone && this._encryptor) {
+      data = this._encryptor.decrypt(data)
     }
     this._bufferSize += data.length
     this._buffer.push(data)
     if (this._buffer.length > 1) {
       this._buffer = [concat(this._buffer, this._bufferSize)]
     }
-    // now this._buffer is an array containing a single Buffer
+    this._processBuffer()
+    cb(null)
+  }
+
+  /**
+   * Process buffered data through the parser state machine.
+   * Safe for async parser callbacks (detects Promises and prevents re-entrance).
+   */
+  async _processBuffer () {
     if (this._cryptoSyncPattern) {
-      const index = this._buffer[0].indexOf(this._cryptoSyncPattern)
+      const index = this._encryptor._indexOf(this._buffer[0], this._cryptoSyncPattern)
       if (index !== -1) {
         this._buffer[0] = this._buffer[0].slice(index + this._cryptoSyncPattern.length)
         this._bufferSize -= (index + this._cryptoSyncPattern.length)
         this._cryptoSyncPattern = null
-      } else if (this._bufferSize + data.length > this._waitMaxBytes + this._cryptoSyncPattern.length) {
+      } else if (this._bufferSize > this._waitMaxBytes + this._cryptoSyncPattern.length) {
         this._debug('Error: could not resynchronize')
         this.destroy()
         return
       }
+      if (this._cryptoSyncPattern) return
     }
 
-    while (this._bufferSize >= this._parserSize && !this._cryptoSyncPattern) {
+    if (this._asyncParsePending) return
+
+    while (this._bufferSize >= this._parserSize) {
+      // Stop if a sync pattern was set in the callback (e.g. from _parsePe3)
+      if (this._cryptoSyncPattern) break
       if (this._parserSize === 0) {
         this._parser(new Uint8Array())
       } else {
-        const buffer = this._buffer[0]
-
+        const buf = this._buffer[0]
         this._bufferSize -= this._parserSize
         this._buffer = this._bufferSize
-          ? [buffer.subarray(this._parserSize)]
+          ? [buf.subarray(this._parserSize)]
           : []
-        this._parser(buffer.subarray(0, this._parserSize))
+        const result = this._parser(buf.subarray(0, this._parserSize))
+        if (result instanceof Promise) {
+          this._asyncParsePending = true
+          try {
+            await result
+          } catch (err) {
+            this._debug('Error: async parse error %s', err.message || err)
+          }
+          this._asyncParsePending = false
+          this._processBuffer()
+          break
+        }
       }
     }
-
-    cb(null) // Signal that we're ready for more data
   }
 
   _callback (request, err, buffer) {
@@ -1136,57 +1067,75 @@ class Wire extends Duplex {
   }
 
   _parsePe1 (pubKeyPrefix) {
-    this._parse(95, pubKeySuffix => {
-      this._onPe1(concat([pubKeyPrefix, pubKeySuffix]))
-      this._parsePe3()
+    this._parse(95, async pubKeySuffix => {
+      this._encryptor = new MessageStreamEncryptor(null)
+      this._encryptor.handleStepB1(concat([pubKeyPrefix, pubKeySuffix]))
+      const step2 = this._encryptor.generateStepB2()
+      this._push(step2)
+      this._peState = 'sentPe2'
+      this._debug('PE: handled step 1, sent step 2 (responder)')
+      await this._parsePe3()
     })
   }
 
   _parsePe2 () {
     this._parse(96, async pubKey => {
-      this._onPe2(pubKey)
-      if (!this._setGenerators) {
-        // Wait until generators have been set
-        await new Promise(resolve => this.once('_generators', resolve))
-      }
-      this._parsePe4()
+      // Initiator: step 2 received from responder
+      await this._encryptor.handleStepA2(pubKey)
+      this._peState = 'gotPe2'
+      this._debug('PE: handled step 2 (initiator)')
+      await this._advanceEncryption()
     })
   }
 
   // Handles the unencrypted portion of step 4
   async _parsePe3 () {
-    const hash1Buffer = await hash(hex2arr(this._utfToHex('req1') + this._sharedSecret))
-    // synchronize on HASH('req1', S)
-    this._parseUntil(hash1Buffer, 512)
+    const hash1Buffer = await hash(concat([REQ1_STR, this._encryptor.S]))
+    this._parseUntil(hash1Buffer, SYNC_MAX_BYTES)
     this._parse(20, async buffer => {
-      this._onPe3(buffer)
-      if (!this._setGenerators) {
+      const req3Hash = await hash(concat([REQ3_STR, this._encryptor.S]))
+      const infoHashHash = arr2hex(xor(new Uint8Array(req3Hash), buffer))
+      this._peState = 'gotPe3'
+      this._debug('PE: handled step 3 XOR hash (responder)')
+      this.emit('crypto-infohash', infoHashHash)
+      await new Promise(resolve => {
         // Wait until generators have been set
-        await new Promise(resolve => this.once('_generators', resolve))
-      }
-      this._parsePe3Encrypted()
+        this._pePendingResolver = resolve
+      })
     })
   }
 
   _parsePe3Encrypted () {
     this._parse(14, buffer => {
-      const vcBuffer = this._decryptHandshake(buffer.slice(0, 8))
-      const peerProvideBuffer = this._decryptHandshake(buffer.slice(8, 12))
-      const padCLen = new DataView(this._decryptHandshake(buffer.slice(12, 14)).buffer).getUint16(0)
-      this._parse(padCLen, padCBuffer => {
-        padCBuffer = this._decryptHandshake(padCBuffer)
+      // Decrypt VC (8) + crypto_provide (4) + padC_len (2)
+      const decHeader = this._encryptor._decryptHandshake(buffer)
+      const vc = decHeader.slice(0, 8)
+      if (!equal(vc, VC)) {
+        this._debug('Error: VC verification failed in pe3')
+        this.destroy()
+        return
+      }
+      const cryptoProvide = new DataView(decHeader.buffer, decHeader.byteOffset + 8, 4).getUint32(0, false)
+      if ((cryptoProvide & 0x02) !== 0) {
+        this._encryptionMethod = 2
+      } else {
+        this._debug('Error: RC4 not provided by peer')
+        this.destroy()
+        return
+      }
+      const padCLen = new DataView(decHeader.buffer, decHeader.byteOffset + 12, 2).getUint16(0, false)
+      this._parse(padCLen, padCBuf => {
+        this._encryptor._decryptHandshake(padCBuf) // discard padC
         this._parse(2, iaLenBuf => {
-          const iaLen = new DataView(this._decryptHandshake(iaLenBuf).buffer).getUint16(0)
+          const iaLen = new DataView(this._encryptor._decryptHandshake(iaLenBuf).buffer).getUint16(0, false)
           this._parse(iaLen, iaBuffer => {
-            iaBuffer = this._decryptHandshake(iaBuffer)
-            this._onPe3Encrypted(vcBuffer, peerProvideBuffer, padCBuffer, iaBuffer)
-            const pstrlen = iaLen ? iaBuffer[0] : null
-            const protocol = iaLen ? iaBuffer.slice(1, 20) : null
-            if (pstrlen === 19 && arr2text(protocol) === 'BitTorrent protocol') {
-              this._onHandshakeBuffer(iaBuffer.slice(1))
-            } else {
-              this._parseHandshake()
+            const ia = this._encryptor._decryptHandshake(iaBuffer)
+            // Check if IA contains a BT handshake
+            if (ia.length > 0 && ia[0] === 19 && arr2text(ia.slice(1, 20)) === 'BitTorrent protocol') {
+              this._onHandshakeBuffer(ia.slice(1))
             }
+            // Complete crypto handshake - send pe4
+            this._advanceEncryption()
           })
         })
       })
@@ -1197,14 +1146,31 @@ class Wire extends Duplex {
     // synchronize on ENCRYPT(VC).
     // since we encrypt using bitwise xor, decryption and encryption are the same operation.
     // calling _decryptHandshake here advances the decrypt generator keystream forward 8 bytes
-    const vcBufferEncrypted = this._decryptHandshake(VC)
-    this._parseUntil(vcBufferEncrypted, 512)
+    const vcBufferEncrypted = this._encryptor._decryptHandshake(VC)
+    this._parseUntil(vcBufferEncrypted, SYNC_MAX_BYTES)
     this._parse(6, buffer => {
-      const peerSelectBuffer = this._decryptHandshake(buffer.slice(0, 4))
-      const padDLen = new DataView(this._decryptHandshake(buffer.slice(4, 6)).buffer).getUint16(0)
+      const peerSelect = this._encryptor._decryptHandshake(buffer)
+      const selectMethod = new DataView(peerSelect.buffer, peerSelect.byteOffset, 4).getUint32(0, false)
+      if (selectMethod !== 2) {
+        this._debug('Error: peer selected non-RC4 method (%s)', selectMethod.toString(16))
+        this.destroy()
+        return
+      }
+      this._encryptionMethod = 2
+      const padDLen = new DataView(peerSelect.buffer, peerSelect.byteOffset + 4, 2).getUint16(0, false)
       this._parse(padDLen, padDBuf => {
-        this._decryptHandshake(padDBuf)
-        this._onPe4(peerSelectBuffer)
+        this._encryptor._decryptHandshake(padDBuf)
+        this._cryptoHandshakeDone = true
+        this._encryptionMethod = 2
+        this._encryptor._isEncrypted = true
+        // Decrypt data that was buffered before crypto was established
+        if (this._bufferSize > 0) {
+          const buf = concat(this._buffer, this._bufferSize)
+          this._buffer = [this._encryptor.decrypt(buf)]
+        }
+        this._peState = 'done'
+        this._debug('PE: handled step 4, crypto handshake done')
+        this.emit('crypto-handshake')
         this._parseHandshake(null)
       })
     })
@@ -1274,68 +1240,6 @@ class Wire extends Duplex {
       }
     }
     return null
-  }
-
-  _encryptHandshake (buf) {
-    const crypt = new Uint8Array(buf)
-    if (!this._encryptGenerator) {
-      this._debug('Warning: Encrypting without any generator')
-      return crypt
-    }
-
-    for (let i = 0; i < buf.length; i++) {
-      const keystream = this._encryptGenerator.randomByte()
-      crypt[i] = crypt[i] ^ keystream
-    }
-
-    return crypt
-  }
-
-  _encrypt (buf) {
-    const crypt = new Uint8Array(buf)
-
-    if (!this._encryptGenerator || this._encryptionMethod !== 2) {
-      return crypt
-    }
-    for (let i = 0; i < buf.length; i++) {
-      const keystream = this._encryptGenerator.randomByte()
-      crypt[i] = crypt[i] ^ keystream
-    }
-
-    return crypt
-  }
-
-  _decryptHandshake (buf) {
-    const decrypt = new Uint8Array(buf)
-
-    if (!this._decryptGenerator) {
-      this._debug('Warning: Decrypting without any generator')
-      return decrypt
-    }
-    for (let i = 0; i < buf.length; i++) {
-      const keystream = this._decryptGenerator.randomByte()
-      decrypt[i] = decrypt[i] ^ keystream
-    }
-
-    return decrypt
-  }
-
-  _decrypt (buf) {
-    const decrypt = new Uint8Array(buf)
-
-    if (!this._decryptGenerator || this._encryptionMethod !== 2) {
-      return decrypt
-    }
-    for (let i = 0; i < buf.length; i++) {
-      const keystream = this._decryptGenerator.randomByte()
-      decrypt[i] = decrypt[i] ^ keystream
-    }
-
-    return decrypt
-  }
-
-  _utfToHex (str) {
-    return arr2hex(text2arr(str))
   }
 }
 
